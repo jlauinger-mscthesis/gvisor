@@ -82,7 +82,8 @@ type PacketBuffer struct {
 // VectorisedView but does not deep copy the underlying bytes.
 //
 // Clone also does not deep copy any of its other fields.
-func (pk PacketBuffer) Clone() PacketBuffer {
-	pk.Data = pk.Data.Clone(nil)
-	return pk
+func (pk *PacketBuffer) Clone() *PacketBuffer {
+	newPk := *pk
+	newPk.Data = newPk.Data.Clone(nil)
+	return &newPk
 }
