@@ -324,29 +324,15 @@ func createSpecs(cmds ...[]string) ([]*specs.Spec, []string) {
 }
 
 func startContainers(t *testing.T, specs []*specs.Spec, ids []string) ([]*container.Container, func(), error) {
-	var (
-		containers []*container.Container
-		cleanups   []func()
-	)
-	cleanups = append(cleanups, func() {
-		for _, c := range containers {
-			c.Destroy()
-		}
-	})
-	cleanupAll := func() {
-		for _, c := range cleanups {
-			c()
-		}
-	}
-	localClean := specutils.MakeCleanup(cleanupAll)
-	defer localClean.Clean()
+	var containers []*container.Container
 
 	// All containers must share the same root.
 	rootDir, cleanup, err := testutil.SetupRootDir()
 	if err != nil {
 		t.Fatalf("error creating root dir: %v", err)
 	}
-	cleanups = append(cleanups, cleanup)
+	cu := cleanup.MakeCleanup(cleanup)
+	defer cu.Clean()
 
 	// Point this to from the configuration.
 	conf := testutil.TestConfig(t)
@@ -357,7 +343,7 @@ func startContainers(t *testing.T, specs []*specs.Spec, ids []string) ([]*contai
 		if err != nil {
 			return nil, nil, fmt.Errorf("error setting up bundle: %v", err)
 		}
-		cleanups = append(cleanups, cleanup)
+		cu.Add(cleanup)
 
 		args := container.Args{
 			ID:        ids[i],
@@ -375,6 +361,5 @@ func startContainers(t *testing.T, specs []*specs.Spec, ids []string) ([]*contai
 		}
 	}
 
-	localClean.Release()
-	return containers, cleanupAll, nil
+	return containers, cu.Release(), nil
 }
