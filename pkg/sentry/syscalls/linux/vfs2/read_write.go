@@ -60,7 +60,7 @@ func Read(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 		return 0, nil, err
 	}
 
-	n, err := read(t, file, dst, vfs.ReadOptions{})
+	n, err := readWithInotify(t, file, dst, vfs.ReadOptions{})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "read", file)
 }
@@ -85,9 +85,17 @@ func Readv(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, err
 	}
 
-	n, err := read(t, file, dst, vfs.ReadOptions{})
+	n, err := readWithInotify(t, file, dst, vfs.ReadOptions{})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "readv", file)
+}
+
+func readWithInotify(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	n, err := read(t, file, dst, opts)
+	if n > 0 {
+		file.Dentry().InotifyWithParent(linux.IN_ACCESS, 0)
+	}
+	return n, err
 }
 
 func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
@@ -194,7 +202,7 @@ func Preadv(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		return 0, nil, err
 	}
 
-	n, err := pread(t, file, dst, offset, vfs.ReadOptions{})
+	n, err := preadWithInotify(t, file, dst, offset, vfs.ReadOptions{})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "preadv", file)
 }
@@ -237,12 +245,20 @@ func Preadv2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	}
 	var n int64
 	if offset == -1 {
-		n, err = read(t, file, dst, opts)
+		n, err = readWithInotify(t, file, dst, opts)
 	} else {
-		n, err = pread(t, file, dst, offset, opts)
+		n, err = preadWithInotify(t, file, dst, offset, opts)
 	}
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "preadv2", file)
+}
+
+func preadWithInotify(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	n, err := pread(t, file, dst, offset, opts)
+	if n > 0 {
+		file.Dentry().InotifyWithParent(linux.IN_ACCESS, 0)
+	}
+	return n, err
 }
 
 func pread(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
@@ -283,6 +299,9 @@ func pread(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, of
 	}
 	file.EventUnregister(&w)
 
+	if total > 0 {
+		file.Dentry().InotifyWithParent(linux.IN_ACCESS, 0)
+	}
 	return total, err
 }
 
@@ -312,7 +331,7 @@ func Write(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, err
 	}
 
-	n, err := write(t, file, src, vfs.WriteOptions{})
+	n, err := writeWithInotify(t, file, src, vfs.WriteOptions{})
 	t.IOUsage().AccountWriteSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "write", file)
 }
@@ -337,9 +356,17 @@ func Writev(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		return 0, nil, err
 	}
 
-	n, err := write(t, file, src, vfs.WriteOptions{})
+	n, err := writeWithInotify(t, file, src, vfs.WriteOptions{})
 	t.IOUsage().AccountWriteSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "writev", file)
+}
+
+func writeWithInotify(t *kernel.Task, file *vfs.FileDescription, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
+	n, err := write(t, file, src, opts)
+	if n > 0 {
+		file.Dentry().InotifyWithParent(linux.IN_MODIFY, 0)
+	}
+	return n, err
 }
 
 func write(t *kernel.Task, file *vfs.FileDescription, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
@@ -415,7 +442,7 @@ func Pwrite64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 		return 0, nil, err
 	}
 
-	n, err := pwrite(t, file, src, offset, vfs.WriteOptions{})
+	n, err := pwriteWithInotify(t, file, src, offset, vfs.WriteOptions{})
 	t.IOUsage().AccountWriteSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "pwrite64", file)
 }
@@ -446,7 +473,7 @@ func Pwritev(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 		return 0, nil, err
 	}
 
-	n, err := pwrite(t, file, src, offset, vfs.WriteOptions{})
+	n, err := pwriteWithInotify(t, file, src, offset, vfs.WriteOptions{})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "pwritev", file)
 }
@@ -489,12 +516,20 @@ func Pwritev2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	}
 	var n int64
 	if offset == -1 {
-		n, err = write(t, file, src, opts)
+		n, err = writeWithInotify(t, file, src, opts)
 	} else {
-		n, err = pwrite(t, file, src, offset, opts)
+		n, err = pwriteWithInotify(t, file, src, offset, opts)
 	}
 	t.IOUsage().AccountWriteSyscall(n)
 	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, kernel.ERESTARTSYS, "pwritev2", file)
+}
+
+func pwriteWithInotify(t *kernel.Task, file *vfs.FileDescription, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
+	n, err := pwrite(t, file, src, offset, opts)
+	if n > 0 {
+		file.Dentry().InotifyWithParent(linux.IN_MODIFY, 0)
+	}
+	return n, err
 }
 
 func pwrite(t *kernel.Task, file *vfs.FileDescription, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
