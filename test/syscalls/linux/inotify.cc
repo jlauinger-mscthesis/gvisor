@@ -33,6 +33,7 @@
 #include "test/util/epoll_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -335,6 +336,11 @@ TEST(Inotify, InotifyFdNotWritable) {
   EXPECT_THAT(write(fd.get(), "x", 1), SyscallFailsWithErrno(EBADF));
 }
 
+TEST(Inotify, InitFlags) {
+  EXPECT_THAT(inotify_init1(IN_NONBLOCK | IN_CLOEXEC), SyscallSucceeds());
+  EXPECT_THAT(inotify_init1(12345), SyscallFailsWithErrno(EINVAL));
+}
+
 TEST(Inotify, NonBlockingReadReturnsEagain) {
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
@@ -395,7 +401,7 @@ TEST(Inotify, CanDeleteFileAfterRemovingWatch) {
   file1.reset();
 }
 
-TEST(Inotify, CanRemoveWatchAfterDeletingFile) {
+TEST(Inotify, RemoveWatchAfterDeletingFileFails) {
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   TempPath file1 =
       ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
@@ -491,17 +497,23 @@ TEST(Inotify, DeletingChildGeneratesEvents) {
                     Event(IN_DELETE, root_wd, Basename(file1_path))}));
 }
 
+// Creating a file in "parent/child" should generate events for child, but not
+// parent.
 TEST(Inotify, CreatingFileGeneratesEvents) {
-  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath child =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
 
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), parent.path(), IN_ALL_EVENTS));
   const int wd = ASSERT_NO_ERRNO_AND_VALUE(
-      InotifyAddWatch(fd.get(), root.path(), IN_ALL_EVENTS));
+      InotifyAddWatch(fd.get(), child.path(), IN_ALL_EVENTS));
 
   // Create a new file in the directory.
   const TempPath file1 =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(child.path()));
   const std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
 
@@ -554,6 +566,47 @@ TEST(Inotify, WritingFileGeneratesModifyEvent) {
   ASSERT_THAT(events, Are({Event(IN_MODIFY, wd, Basename(file1.path()))}));
 }
 
+TEST(Inotify, SizeZeroReadWriteGeneratesNothing) {
+  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const TempPath file1 =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(root.path()));
+
+  const FileDescriptor file1_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file1.path(), O_RDWR));
+  ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), root.path(), IN_ALL_EVENTS));
+
+  // Read from the empty file.
+  int val;
+  ASSERT_THAT(read(file1_fd.get(), &val, sizeof(val)),
+              SyscallSucceedsWithValue(0));
+
+  // Write zero bytes.
+  ASSERT_THAT(write(file1_fd.get(), "", 0), SyscallSucceedsWithValue(0));
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
+  ASSERT_THAT(events, Are({}));
+}
+
+TEST(Inotify, FailedFileCreationGeneratesNoEvents) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), dir.path(), IN_ALL_EVENTS));
+
+  const char* p = dir.path().c_str();
+  ASSERT_THAT(mkdir(p, 0777), SyscallFails());
+  ASSERT_THAT(mknod(p, S_IFIFO, 0777), SyscallFails());
+  ASSERT_THAT(symlink(p, p), SyscallFails());
+  ASSERT_THAT(link(p, p), SyscallFails());
+  std::vector<Event> events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
+  ASSERT_THAT(events, Are({}));
+}
+
 TEST(Inotify, WatchSetAfterOpenReportsCloseFdEvent) {
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   const FileDescriptor fd =
@@ -602,7 +655,7 @@ TEST(Inotify, ChildrenDeletionInWatchedDirGeneratesEvent) {
                    Event(IN_DELETE | IN_ISDIR, wd, Basename(dir1_path))}));
 }
 
-TEST(Inotify, WatchTargetDeletionGeneratesEvent) {
+TEST(Inotify, RmdirOnWatchedTargetGeneratesEvent) {
   const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
@@ -1228,7 +1281,7 @@ TEST(Inotify, LinkGeneratesAttribAndCreateEvents) {
       InotifyAddWatch(fd.get(), file1.path(), IN_ALL_EVENTS));
 
   const int rc = link(file1.path().c_str(), link1.path().c_str());
-  // link(2) is only supported on tmpfs in the sandbox.
+  // NOTE(b/34861058): link(2) is only supported on tmpfs in the sandbox.
   SKIP_IF(IsRunningOnGvisor() && rc != 0 &&
           (errno == EPERM || errno == ENOENT));
   ASSERT_THAT(rc, SyscallSucceeds());
@@ -1322,21 +1375,27 @@ TEST(Inotify, HardlinksReuseSameWatch) {
                     Event(IN_DELETE, root_wd, Basename(file1_path))}));
 }
 
+// Calling mkdir within "parent/child" should generate an event for child, but
+// not parent.
 TEST(Inotify, MkdirGeneratesCreateEventWithDirFlag) {
-  const TempPath root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath child =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
-  const int root_wd = ASSERT_NO_ERRNO_AND_VALUE(
-      InotifyAddWatch(fd.get(), root.path(), IN_ALL_EVENTS));
+  ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), parent.path(), IN_ALL_EVENTS));
+  const int child_wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), child.path(), IN_ALL_EVENTS));
 
-  const TempPath dir1(NewTempAbsPathInDir(root.path()));
+  const TempPath dir1(NewTempAbsPathInDir(child.path()));
   ASSERT_THAT(mkdir(dir1.path().c_str(), 0777), SyscallSucceeds());
 
   const std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
   ASSERT_THAT(
       events,
-      Are({Event(IN_CREATE | IN_ISDIR, root_wd, Basename(dir1.path()))}));
+      Are({Event(IN_CREATE | IN_ISDIR, child_wd, Basename(dir1.path()))}));
 }
 
 TEST(Inotify, MultipleInotifyInstancesAndWatchesAllGetEvents) {
@@ -1597,6 +1656,8 @@ TEST(Inotify, EpollNoDeadlock) {
 }
 
 TEST(Inotify, SpliceEvent) {
+  // TODO(gvisor.dev/issue/138): Implement splice in VFS2.
+  SKIP_IF(IsRunningOnGvisor() && !IsRunningWithVFS1());
   int pipes[2];
   ASSERT_THAT(pipe2(pipes, O_NONBLOCK), SyscallSucceeds());
 
@@ -1622,6 +1683,235 @@ TEST(Inotify, SpliceEvent) {
   const std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(read_fd.get()));
   ASSERT_THAT(events, Are({Event(IN_ACCESS, watcher)}));
+}
+
+// Watches on a parent should not be triggered by actions on a hard link to one
+// of its children that has a different parent.
+TEST(Inotify, LinkOnOtherParent) {
+  const TempPath dir1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir1.path()));
+  std::string link_path = NewTempAbsPathInDir(dir2.path());
+
+  const int rc = link(file.path().c_str(), link_path.c_str());
+  // NOTE(b/34861058): link(2) is only supported on tmpfs in the sandbox.
+  SKIP_IF(IsRunningOnGvisor() && rc != 0 &&
+          (errno == EPERM || errno == ENOENT));
+  ASSERT_THAT(rc, SyscallSucceeds());
+
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(inotify_fd.get(), dir1.path(), IN_ALL_EVENTS));
+
+  // Perform various actions on the link outside of dir1, which should trigger
+  // no inotify events.
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(link_path.c_str(), O_RDWR));
+  int val = 0;
+  ASSERT_THAT(write(fd.get(), &val, sizeof(val)), SyscallSucceeds());
+  ASSERT_THAT(read(fd.get(), &val, sizeof(val)), SyscallSucceeds());
+  ASSERT_THAT(ftruncate(fd.get(), 12345), SyscallSucceeds());
+  ASSERT_THAT(unlink(link_path.c_str()), SyscallSucceeds());
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({}));
+}
+
+TEST(Inotify, Exec) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath bin = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(dir.path(), "/bin/true"));
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), bin.path(), IN_ALL_EVENTS));
+
+  // Perform exec.
+  ScopedThread t([&bin]() {
+    ASSERT_THAT(execl(bin.path().c_str(), bin.path().c_str(), (char*)nullptr),
+                SyscallSucceeds());
+  });
+  t.Join();
+
+  std::vector<Event> events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
+  EXPECT_THAT(events, Are({Event(IN_OPEN, wd), Event(IN_ACCESS, wd)}));
+}
+
+// Watches without IN_EXCL_UNLINK, should continue to emit events for file
+// descriptors after their corresponding files have been unlinked.
+TEST(Inotify, IncludeUnlinkedFile) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), "123", TempPath::kDefaultFileMode));
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
+
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int dir_wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(inotify_fd.get(), dir.path(), IN_ALL_EVENTS));
+  const int file_wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(inotify_fd.get(), file.path(), IN_ALL_EVENTS));
+
+  ASSERT_THAT(unlink(file.path().c_str()), SyscallSucceeds());
+  int val = 0;
+  ASSERT_THAT(read(fd.get(), &val, sizeof(val)), SyscallSucceeds());
+  ASSERT_THAT(write(fd.get(), &val, sizeof(val)), SyscallSucceeds());
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({
+                          Event(IN_ATTRIB, file_wd),
+                          Event(IN_DELETE, dir_wd, Basename(file.path())),
+                          Event(IN_ACCESS, dir_wd, Basename(file.path())),
+                          Event(IN_ACCESS, file_wd),
+                          Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                          Event(IN_MODIFY, file_wd),
+                      }));
+}
+
+// Watches created with IN_EXCL_UNLINK will stop emitting events on fds for
+// children that have already been unlinked.
+TEST(Inotify, ExcludeUnlink) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
+
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+
+  // Unlink the child, which should cause further operations on the open file
+  // descriptor to be ignored.
+  ASSERT_THAT(unlink(file.path().c_str()), SyscallSucceeds());
+  int val = 0;
+  ASSERT_THAT(write(fd.get(), &val, sizeof(val)), SyscallSucceeds());
+  ASSERT_THAT(read(fd.get(), &val, sizeof(val)), SyscallSucceeds());
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({Event(IN_DELETE, wd, Basename(file.path()))}));
+}
+
+TEST(Inotify, ExcludeUnlinkDirectory) {
+  const TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  TempPath dir =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(parent.path()));
+  std::string dirPath = dir.path();
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(dirPath.c_str(), O_RDONLY | O_DIRECTORY));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), parent.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+
+  // Unlink the dir, and then close the open fd.
+  ASSERT_THAT(rmdir(dirPath.c_str()), SyscallSucceeds());
+  dir.reset();
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  // No close event should appear.
+  ASSERT_THAT(events,
+              Are({Event(IN_DELETE | IN_ISDIR, wd, Basename(dirPath))}));
+}
+
+// A watch with IN_EXCL_UNLINK will continue emitting events for fds on a child
+// even if another link to the child is unlinked.
+TEST(Inotify, ExcludeUnlinkOtherChild) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  std::string link_path = NewTempAbsPathInDir(dir.path());
+
+  const int rc = link(file.path().c_str(), link_path.c_str());
+  // NOTE(b/34861058): link(2) is only supported on tmpfs in the sandbox.
+  SKIP_IF(IsRunningOnGvisor() && rc != 0 &&
+          (errno == EPERM || errno == ENOENT));
+  ASSERT_THAT(rc, SyscallSucceeds());
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path().c_str(), O_RDWR));
+  const FileDescriptor link_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(link_path.c_str(), O_RDWR));
+
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+  ASSERT_THAT(unlink(link_path.c_str()), SyscallSucceeds());
+  ASSERT_THAT(write(fd.get(), "x", 1), SyscallSucceeds());
+  ASSERT_THAT(write(link_fd.get(), "x", 1), SyscallSucceeds());
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({
+                          Event(IN_DELETE, wd, Basename(link_path)),
+                          Event(IN_MODIFY, wd, Basename(file.path())),
+                      }));
+}
+
+// On native Linux, actions of data type FSNOTIFY_EVENT_INODE are not affected
+// by IN_EXCL_UNLINK (see
+// fs/notify/inotify/inotify_fsnotify.c:inotify_handle_event). Inode-level
+// events include changes to metadata and extended attributes.
+TEST(Inotify, ExcludeUnlinkInodeEvents_NoRandomSave) {
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const TempPath file =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path().c_str(), O_RDWR));
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+
+  // TODO(deandeng): b/157163751 addresses the underlying issue. But this
+  // probably doesn't work on VFS2, which doesn't allow hard link creation...
+  // But then the test is skipped anyway because link(2) will fail...so
+  // everything probably works, although it is very hacky.
+  //
+  // NOTE(b/157163751): Create another link before unlinking. Operations on the
+  // open fd will still work without the extra link on native Linux, but it is
+  // necessary for gofer-based filesystems in gVisor.
+  std::string link_path = NewTempAbsPath();
+  const int rc = link(file.path().c_str(), link_path.c_str());
+  // NOTE(b/34861058): link(2) is only supported on tmpfs in the sandbox.
+  SKIP_IF(IsRunningOnGvisor() && rc != 0 &&
+          (errno == EPERM || errno == ENOENT));
+  ASSERT_THAT(rc, SyscallSucceeds());
+
+  // Even after unlinking, inode-level events will trigger events regardless of
+  // IN_EXCL_UNLINK.
+  ASSERT_THAT(unlink(file.path().c_str()), SyscallSucceeds());
+
+  // Perform various actions on fd.
+  ASSERT_THAT(ftruncate(fd.get(), 12345), SyscallSucceeds());
+  std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({
+                          Event(IN_DELETE, wd, Basename(file.path())),
+                          Event(IN_MODIFY, wd, Basename(file.path())),
+                      }));
+
+  struct timeval times[2] = {{1, 0}, {2, 0}};
+  ASSERT_THAT(futimes(fd.get(), times), SyscallSucceeds());
+  events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({Event(IN_ATTRIB, wd, Basename(file.path()))}));
+
+  // Disable S/R before fchmod. Otherwise, the test will always fail because
+  // nodes can't be saved when they have stricter permissions than the original.
+  const DisableSave ds;
+  ASSERT_THAT(fchmod(fd.get(), 0777), SyscallSucceeds());
+  events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({Event(IN_ATTRIB, wd, Basename(file.path()))}));
 }
 
 }  // namespace
